@@ -18,9 +18,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Text;
 using System.Threading.Tasks;
 using Confluent.Kafka;
+using Newtonsoft.Json.Linq;
+using NJsonSchema;
 using NJsonSchema.Generation;
 
 
@@ -46,10 +49,8 @@ namespace Confluent.SchemaRegistry.Serdes
     ///     integration of System.Text.Json and JSON Schema, so this
     ///     is not yet supported by the deserializer.
     /// </remarks>
-    public class JsonDeserializer<T> : IAsyncDeserializer<T> where T : class
+    public class JsonDeserializer<T> : AsyncDeserializer<T, JsonSchema> where T : class
     {
-        private readonly int headerSize =  sizeof(int) + sizeof(byte);
-        
         private readonly JsonSchemaGeneratorSettings jsonSchemaGeneratorSettings;
 
         /// <summary>
@@ -62,16 +63,34 @@ namespace Confluent.SchemaRegistry.Serdes
         /// <param name="jsonSchemaGeneratorSettings">
         ///     JSON schema generator settings.
         /// </param>
-        public JsonDeserializer(IEnumerable<KeyValuePair<string, string>> config = null, JsonSchemaGeneratorSettings jsonSchemaGeneratorSettings = null)
+        public JsonDeserializer(IEnumerable<KeyValuePair<string, string>> config = null, JsonSchemaGeneratorSettings jsonSchemaGeneratorSettings = null) :
+            this(null, config, jsonSchemaGeneratorSettings)
+        {
+        }
+
+        public JsonDeserializer(ISchemaRegistryClient schemaRegistryClient, IEnumerable<KeyValuePair<string, string>> config = null, JsonSchemaGeneratorSettings jsonSchemaGeneratorSettings = null) 
+            : this(schemaRegistryClient, config != null ? new JsonDeserializerConfig(config) : null, jsonSchemaGeneratorSettings)
+        {
+        }
+
+        public JsonDeserializer(ISchemaRegistryClient schemaRegistryClient, JsonDeserializerConfig config, 
+            JsonSchemaGeneratorSettings jsonSchemaGeneratorSettings = null, IList<IRuleExecutor> ruleExecutors = null) 
+            : base(schemaRegistryClient, config, ruleExecutors)
         {
             this.jsonSchemaGeneratorSettings = jsonSchemaGeneratorSettings;
 
             if (config == null) { return; }
 
-            if (config.Count() > 0)
+            var nonJsonConfig = config
+                .Where(item => !item.Key.StartsWith("json.") && !item.Key.StartsWith("rules."));
+            if (nonJsonConfig.Count() > 0)
             {
-                throw new ArgumentException($"JsonDeserializer: unknown configuration parameter {config.First().Key}.");
+                throw new ArgumentException($"JsonDeserializer: unknown configuration parameter {nonJsonConfig.First().Key}.");
             }
+
+            if (config.UseLatestVersion != null) { this.useLatestVersion = config.UseLatestVersion.Value; }
+            if (config.UseLatestWithMetadata != null) { this.useLatestWithMetadata = config.UseLatestWithMetadata; }
+            if (config.SubjectNameStrategy != null) { this.subjectNameStrategy = config.SubjectNameStrategy.Value.ToDelegate(); }
         }
 
         /// <summary>
@@ -91,37 +110,113 @@ namespace Confluent.SchemaRegistry.Serdes
         ///     A <see cref="System.Threading.Tasks.Task" /> that completes
         ///     with the deserialized value.
         /// </returns>
-        public Task<T> DeserializeAsync(ReadOnlyMemory<byte> data, bool isNull, SerializationContext context)
+        public override async Task<T> DeserializeAsync(ReadOnlyMemory<byte> data, bool isNull, SerializationContext context)
         {
-            if (isNull) { return Task.FromResult<T>(null); }
+            if (isNull) { return null; }
 
+            var array = data.ToArray();
+            if (array.Length < 6)
+            {
+                throw new InvalidDataException($"Expecting data framing of length 6 bytes or more but total data size is {array.Length} bytes");
+            }
+            
+            bool isKey = context.Component == MessageComponentType.Key;
+            string topic = context.Topic;
+            string subject = this.subjectNameStrategy != null
+                // use the subject name strategy specified in the serializer config if available.
+                ? this.subjectNameStrategy(
+                    new SerializationContext(isKey ? MessageComponentType.Key : MessageComponentType.Value, topic),
+                    null)
+                // else fall back to the deprecated config from (or default as currently supplied by) SchemaRegistry.
+                : schemaRegistryClient == null 
+                    ? null
+                    : isKey 
+                        ? schemaRegistryClient.ConstructKeySubjectName(topic)
+                        : schemaRegistryClient.ConstructValueSubjectName(topic);
+            
+            Schema latestSchema = await GetReaderSchema(subject)
+                .ConfigureAwait(continueOnCapturedContext: false);
+                
             try
             {
-                var array = data.ToArray();
-
-                if (array.Length < 5)
+                Schema writerSchema = null;
+                JsonSchema writerSchemaJson = null;
+                T value;
+                IList<Migration> migrations = new List<Migration>();
+                using (var stream = new MemoryStream(array))
+                using (var reader = new BinaryReader(stream))
                 {
-                    throw new InvalidDataException($"Expecting data framing of length 5 bytes or more but total data size is {array.Length} bytes");
-                }
+                    var magicByte = reader.ReadByte();
+                    if (magicByte != Constants.MagicByte)
+                    {
+                        throw new InvalidDataException($"Expecting message {context.Component.ToString()} with Confluent Schema Registry framing. Magic byte was {array[0]}, expecting {Constants.MagicByte}");
+                    }
 
-                if (array[0] != Constants.MagicByte)
+                    // A schema is not required to deserialize protobuf messages since the
+                    // serialized data includes tag and type information, which is enough for
+                    // the IMessage<T> implementation to deserialize the data (even if the
+                    // schema has evolved). _schemaId is thus unused.
+                    var writerId = IPAddress.NetworkToHostOrder(reader.ReadInt32());
+
+                    if (schemaRegistryClient != null)
+                    {
+                        (writerSchema, writerSchemaJson) = await GetSchema(writerId);
+                    }
+                    
+                    if (latestSchema != null)
+                    {
+                        migrations = await GetMigrations(subject, writerSchema, latestSchema)
+                            .ConfigureAwait(continueOnCapturedContext: false);
+                    }
+
+                    if (migrations.Count > 0)
+                    {
+                        using (var jsonStream = new MemoryStream(array, headerSize, array.Length - headerSize))
+                        using (var jsonReader = new StreamReader(jsonStream, Encoding.UTF8))
+                        {
+                            JToken json = Newtonsoft.Json.JsonConvert.DeserializeObject<JToken>(jsonReader.ReadToEnd(), this.jsonSchemaGeneratorSettings?.ActualSerializerSettings);
+                            json = await ExecuteMigrations(migrations, isKey, subject, topic, context.Headers, json)
+                                .ContinueWith(t => (JToken)t.Result)
+                                .ConfigureAwait(continueOnCapturedContext: false);
+                            value = json.ToObject<T>();
+                        }
+                    }
+                    else
+                    {
+                        using (var jsonStream = new MemoryStream(array, headerSize, array.Length - headerSize))
+                        using (var jsonReader = new StreamReader(jsonStream, Encoding.UTF8))
+                        {
+                            value = Newtonsoft.Json.JsonConvert.DeserializeObject<T>(jsonReader.ReadToEnd(), this.jsonSchemaGeneratorSettings?.ActualSerializerSettings);
+                        }
+                    }
+
+                    // A schema is not required to deserialize json messages.
+                    // TODO: add validation capability.
+                }
+                if (writerSchema != null)
                 {
-                    throw new InvalidDataException($"Expecting message {context.Component.ToString()} with Confluent Schema Registry framing. Magic byte was {array[0]}, expecting {Constants.MagicByte}");
-                }
-
-                // A schema is not required to deserialize json messages.
-                // TODO: add validation capability.
-
-                using (var stream = new MemoryStream(array, headerSize, array.Length - headerSize))
-                using (var sr = new System.IO.StreamReader(stream, Encoding.UTF8))
-                {
-                    return Task.FromResult(Newtonsoft.Json.JsonConvert.DeserializeObject<T>(sr.ReadToEnd(), this.jsonSchemaGeneratorSettings?.ActualSerializerSettings));
-                }
+                    FieldTransformer fieldTransformer = async (ctx, transform, message) =>
+                    {
+                        return await JsonUtils.Transform(ctx, writerSchemaJson, "$", message, transform).ConfigureAwait(false);
+                    };
+                    value = await ExecuteRules(context.Component == MessageComponentType.Key, subject,
+                            context.Topic, context.Headers, RuleMode.Read, null,
+                            writerSchema, value, fieldTransformer)
+                        .ContinueWith(t => (T)t.Result)
+                        .ConfigureAwait(continueOnCapturedContext: false);
+                } 
+                    
+                return value;
             }
             catch (AggregateException e)
             {
                 throw e.InnerException;
             }
+        }
+
+        protected override async Task<JsonSchema> ParseSchema(Schema schema)
+        {
+            return await JsonSchema.FromJsonAsync(schema).ConfigureAwait(false);
         }
     }
 }
